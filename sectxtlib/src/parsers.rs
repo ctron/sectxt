@@ -8,8 +8,8 @@ use nom::{
     character::complete::{char, crlf, satisfy},
     combinator::{all_consuming, map, opt, recognize},
     multi::{many0_count, many1},
-    sequence::{preceded, terminated, tuple},
-    IResult,
+    sequence::{preceded, terminated},
+    IResult, Parser,
 };
 
 pub(crate) struct SecurityTxtParser {
@@ -23,15 +23,15 @@ impl SecurityTxtParser {
         }
     }
 
-    pub fn parse<'a>(&'a self, text: &'a str) -> Result<Vec<Option<RawField>>, ParseError> {
+    pub fn parse<'a>(&'a self, text: &'a str) -> Result<Vec<Option<RawField<'a>>>, ParseError> {
         let (_, msg) = self.body_parser(text)?;
         Ok(msg)
     }
 
     // body             =  signed / unsigned
     // signed is handled separately.
-    fn body_parser<'a>(&'a self, i: &'a str) -> IResult<&str, Vec<Option<RawField>>> {
-        all_consuming(|x| self.unsigned_parser(x))(i)
+    fn body_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, Vec<Option<RawField<'a>>>> {
+        all_consuming(|x| self.unsigned_parser(x)).parse(i)
     }
 
     // unsigned       =  *line (contact-field eol) ; one or more required
@@ -41,25 +41,24 @@ impl SecurityTxtParser {
     //                   ; except that if contact-field appears more
     //                   ; than once, the order of those indicates
     //                   ; priority (see Section 3.5.3)
-    fn unsigned_parser<'a>(&'a self, i: &'a str) -> IResult<&str, Vec<Option<RawField>>> {
-        many1(|x| self.line_parser(x))(i)
+    fn unsigned_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, Vec<Option<RawField<'a>>>> {
+        many1(|x| self.line_parser(x)).parse(i)
     }
 
     // line             =  [ (field / comment) ] eol
-    fn line_parser<'a>(&'a self, i: &'a str) -> IResult<&str, Option<RawField>> {
+    fn line_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, Option<RawField<'a>>> {
         let field_parser_opt = map(|x| self.field_parser(x), Some);
         let comment_parser_opt = map(|x| self.comment_parser(x), |_| None);
 
-        let (i, raw_field) = terminated(opt(alt((comment_parser_opt, field_parser_opt))), |x| self.eol_parser(x))(i)?;
+        let (i, raw_field) =
+            terminated(opt(alt((comment_parser_opt, field_parser_opt))), |x| self.eol_parser(x)).parse(i)?;
         let flattened = raw_field.flatten();
         Ok((i, flattened))
     }
 
     // eol              =  *WSP [CR] LF
-    fn eol_parser<'a>(&'a self, i: &'a str) -> IResult<&str, &str> {
-        recognize(tuple((take_while(is_wsp), opt(|x| self.cr_parser(x)), |x| {
-            self.lf_parser(x)
-        })))(i)
+    fn eol_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, &'a str> {
+        recognize((take_while(is_wsp), opt(|x| self.cr_parser(x)), |x| self.lf_parser(x))).parse(i)
     }
 
     // field            =  ; optional fields
@@ -70,19 +69,19 @@ impl SecurityTxtParser {
     //                     hiring-field /
     //                     policy-field /
     //                     ext-field
-    fn field_parser<'a>(&'a self, i: &'a str) -> IResult<&str, RawField> {
+    fn field_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, RawField<'a>> {
         self.ext_name_parser(i)
     }
 
     // fs               =  ":"
-    fn fs_parser<'a>(&'a self, i: &'a str) -> IResult<&str, char> {
+    fn fs_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, char> {
         char(':')(i)
     }
 
     // comment          =  "#" *(WSP / VCHAR / %x80-FFFFF)
-    fn comment_parser<'a>(&'a self, i: &'a str) -> IResult<&str, &str> {
+    fn comment_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, &'a str> {
         let matcher = |x| is_wsp(x) || is_vchar(x) || x >= '\u{80}';
-        preceded(char('#'), take_while(matcher))(i)
+        preceded(char('#'), take_while(matcher)).parse(i)
     }
 
     // ack-field        =  "Acknowledgments" fs SP uri
@@ -99,58 +98,61 @@ impl SecurityTxtParser {
     // uri              =  < URI as per Section 3 of [RFC3986] >
 
     // ext-field        =  field-name fs SP unstructured
-    fn ext_name_parser<'a>(&'a self, i: &'a str) -> IResult<&str, RawField> {
-        let (i, (name, _, _, value)) = tuple((
+    fn ext_name_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, RawField<'a>> {
+        let (i, (name, _, _, value)) = (
             |x| self.field_name_parser(x),
             |x| self.fs_parser(x),
             |x| self.sp_parser(x),
             |x| self.unstructured_parser(x),
-        ))(i)?;
+        )
+            .parse(i)?;
         Ok((i, RawField { name, value }))
     }
 
     // field-name       =  < imported from Section 3.6.8 of [RFC5322] >
     // field-name       =  1*ftext
-    fn field_name_parser<'a>(&'a self, i: &'a str) -> IResult<&str, &str> {
+    fn field_name_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, &'a str> {
         take_while1(is_ftext_char)(i)
     }
 
     // < imported from [RFC5322] >
     // unstructured     =   *([FWS] VCHAR) *WSP
     // Ommitted obsolete part.
-    fn unstructured_parser<'a>(&'a self, i: &'a str) -> IResult<&str, &str> {
+    fn unstructured_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, &'a str> {
         recognize(terminated(
             recognize(many0_count(preceded(opt(|x| self.fws_parser(x)), satisfy(is_vchar)))),
             take_while(is_wsp),
-        ))(i)
+        ))
+        .parse(i)
     }
 
     // < imported from [RFC5322] >
     // FWS              =   [*WSP CRLF] 1*WSP
     // Ommitted obsolete part.
-    fn fws_parser<'a>(&'a self, i: &'a str) -> IResult<&str, &str> {
+    fn fws_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, &'a str> {
         recognize(preceded(
-            opt(tuple((take_while(is_wsp), |x| self.crlf_parser(x)))),
+            opt((take_while(is_wsp), |x| self.crlf_parser(x))),
             take_while1(is_wsp),
-        ))(i)
+        ))
+        .parse(i)
     }
 
-    fn cr_parser<'a>(&'a self, i: &'a str) -> IResult<&str, char> {
+    fn cr_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, char> {
         satisfy(is_cr)(i)
     }
 
     // CRLF             =  CR LF
     //                       ; Internet standard newline
-    fn crlf_parser<'a>(&'a self, i: &'a str) -> IResult<&str, &str> {
+    fn crlf_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, &'a str> {
         crlf(i)
     }
 
-    fn lf_parser<'a>(&'a self, i: &'a str) -> IResult<&str, char> {
+    fn lf_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, char> {
         satisfy(is_lf)(i)
     }
 
     // SP               =  %x20
-    fn sp_parser<'a>(&'a self, i: &'a str) -> IResult<&str, char> {
+    fn sp_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, char> {
         char(' ')(i)
     }
 }

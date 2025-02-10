@@ -8,8 +8,8 @@ use nom::{
     character::complete::{line_ending, none_of, one_of},
     combinator::{all_consuming, opt, peek, recognize},
     multi::{many0, many1, many1_count, separated_list1},
-    sequence::{delimited, preceded, separated_pair, terminated, tuple},
-    IResult,
+    sequence::{delimited, preceded, separated_pair, terminated},
+    IResult, Parser,
 };
 
 #[derive(Debug, PartialEq)]
@@ -25,7 +25,7 @@ pub(crate) struct PGPCleartextMessage<'a> {
     pub signature: PGPSignature<'a>,
 }
 
-impl<'a> PGPCleartextMessage<'a> {}
+impl PGPCleartextMessage<'_> {}
 
 pub(crate) struct PGPCleartextMessageParser {
     options: SecurityTxtOptions,
@@ -38,12 +38,12 @@ impl PGPCleartextMessageParser {
         }
     }
 
-    pub fn parse<'a>(&'a self, text: &'a str) -> Result<PGPCleartextMessage, ParseError> {
+    pub fn parse<'a>(&'a self, text: &'a str) -> Result<PGPCleartextMessage<'a>, ParseError> {
         let (_, msg) = self.signed_parser(text)?;
         Ok(msg)
     }
 
-    fn lf_parser<'a>(&'a self, i: &'a str) -> IResult<&str, &str> {
+    fn lf_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, &'a str> {
         match self.options.strict {
             true => line_ending(i),
             false => tag("\n")(i),
@@ -55,14 +55,15 @@ impl PGPCleartextMessageParser {
     //                     CRLF
     //                     cleartext
     //                     signature
-    fn signed_parser<'a>(&'a self, i: &'a str) -> IResult<&str, PGPCleartextMessage> {
-        let (_, (_, hash_armor_headers, _, cleartext, signature)) = all_consuming(tuple((
+    fn signed_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, PGPCleartextMessage<'a>> {
+        let (_, (_, hash_armor_headers, _, cleartext, signature)) = all_consuming((
             |x| self.cleartext_header_parser(x),
             many1(|x| self.hash_header_parser(x)),
             |x| self.lf_parser(x),
             |x| self.cleartext_parser(x),
             |x| self.signature_parser(x),
-        )))(i)?;
+        ))
+        .parse(i)?;
 
         Ok((
             i,
@@ -75,65 +76,60 @@ impl PGPCleartextMessageParser {
     }
 
     // cleartext-header =  %s"-----BEGIN PGP SIGNED MESSAGE-----" CRLF
-    fn cleartext_header_parser<'a>(&'a self, i: &'a str) -> IResult<&str, &str> {
-        terminated(tag("-----BEGIN PGP SIGNED MESSAGE-----"), |x| self.lf_parser(x))(i)
+    fn cleartext_header_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, &'a str> {
+        terminated(tag("-----BEGIN PGP SIGNED MESSAGE-----"), |x| self.lf_parser(x)).parse(i)
     }
 
     // hash-header      =  %s"Hash: " hash-alg *("," hash-alg) CRLF
-    fn hash_header_parser<'a>(&'a self, i: &'a str) -> IResult<&str, Vec<&str>> {
+    fn hash_header_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, Vec<&'a str>> {
         delimited(
             tag("Hash: "),
             separated_list1(tag(","), |x| self.hash_alg_parser(x)),
             |x| self.lf_parser(x),
-        )(i)
+        )
+        .parse(i)
     }
 
     // hash-alg         =  token
     //                       ; imported from RFC 2045; see RFC 4880 Section
     //                       ; 10.3.3 for a pointer to the registry of
     //                       ; valid values
-    fn hash_alg_parser<'a>(&'a self, i: &'a str) -> IResult<&str, &str> {
+    fn hash_alg_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, &'a str> {
         self.token_parser(i)
     }
 
     // < Section 5.1 of [RFC2045] >
     // token := 1*<any (US-ASCII) CHAR except SPACE, CTLs,
     //             or tspecials>
-    fn token_parser<'a>(&'a self, i: &'a str) -> IResult<&str, &str> {
+    fn token_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, &'a str> {
         take_while1(is_token_char)(i)
     }
 
     // cleartext        =  *((line-dash / line-from / line-nodash) [CR] LF)
     // EOL is handled in branches.
-    fn cleartext_parser<'a>(&'a self, i: &'a str) -> IResult<&str, String> {
-        let (i, lines) = many0(alt((|x| self.line_dash_parser(x), |x| self.line_nodash_parser(x))))(i)?;
+    fn cleartext_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, String> {
+        let (i, lines) = many0(alt((|x| self.line_dash_parser(x), |x| self.line_nodash_parser(x)))).parse(i)?;
         Ok((i, lines.join("")))
     }
 
     // line-dash        =  ("- ") "-" *UTF8-char-not-cr
     //                        ; MUST include initial "- "
-    fn line_dash_parser<'a>(&'a self, i: &'a str) -> IResult<&str, &str> {
+    fn line_dash_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, &'a str> {
         preceded(
             tag("- "),
-            recognize(tuple((
-                one_of("-"),
-                take_while(|x| x != '\r' && x != '\n'),
-                line_ending,
-            ))),
-        )(i)
+            recognize((one_of("-"), take_while(|x| x != '\r' && x != '\n'), line_ending)),
+        )
+        .parse(i)
     }
 
     // line-nodash      =  ["- "] *UTF8-char-not-cr
     //                       ; MAY include initial "- "
-    fn line_nodash_parser<'a>(&'a self, i: &'a str) -> IResult<&str, &str> {
+    fn line_nodash_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, &'a str> {
         preceded(
             opt(tag("- ")),
-            recognize(tuple((
-                peek(none_of("-")),
-                take_while(|x| x != '\r' && x != '\n'),
-                line_ending,
-            ))),
-        )(i)
+            recognize((peek(none_of("-")), take_while(|x| x != '\r' && x != '\n'), line_ending)),
+        )
+        .parse(i)
     }
 
     // signature        =  armor-header
@@ -141,26 +137,27 @@ impl PGPCleartextMessageParser {
     //                     CRLF
     //                     signature-data
     //                     armor-tail
-    fn signature_parser<'a>(&'a self, i: &'a str) -> IResult<&str, PGPSignature> {
-        let (i, (_, keys, _, signature, _)) = tuple((
+    fn signature_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, PGPSignature<'a>> {
+        let (i, (_, keys, _, signature, _)) = (
             |x| self.armor_header_parser(x),
             |x| self.armor_keys_parser(x),
             |x| self.lf_parser(x),
             |x| self.signature_data_parser(x),
             |x| self.armor_tail_parser(x),
-        ))(i)?;
+        )
+            .parse(i)?;
 
         Ok((i, PGPSignature { signature, keys }))
     }
 
     // armor-header     =  %s"-----BEGIN PGP SIGNATURE-----" CRLF
-    fn armor_header_parser<'a>(&'a self, i: &'a str) -> IResult<&str, &str> {
-        terminated(tag("-----BEGIN PGP SIGNATURE-----"), |x| self.lf_parser(x))(i)
+    fn armor_header_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, &'a str> {
+        terminated(tag("-----BEGIN PGP SIGNATURE-----"), |x| self.lf_parser(x)).parse(i)
     }
 
     // armor-keys       =  *(token ": " *( VCHAR / WSP ) CRLF)
     //                       ; Armor Header Keys from RFC 4880
-    fn armor_keys_parser<'a>(&'a self, i: &'a str) -> IResult<&str, Vec<(&str, &str)>> {
+    fn armor_keys_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, Vec<(&'a str, &'a str)>> {
         many0(terminated(
             separated_pair(
                 |x| self.token_parser(x),
@@ -168,21 +165,23 @@ impl PGPCleartextMessageParser {
                 take_while(|x| is_vchar(x) || is_wsp(x)),
             ),
             |x| self.lf_parser(x),
-        ))(i)
+        ))
+        .parse(i)
     }
 
     // armor-tail       =  %s"-----END PGP SIGNATURE-----" CRLF
-    fn armor_tail_parser<'a>(&'a self, i: &'a str) -> IResult<&str, &str> {
-        terminated(tag("-----END PGP SIGNATURE-----"), |x| self.lf_parser(x))(i)
+    fn armor_tail_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, &'a str> {
+        terminated(tag("-----END PGP SIGNATURE-----"), |x| self.lf_parser(x)).parse(i)
     }
 
     // signature-data   =  1*(1*(ALPHA / DIGIT / "=" / "+" / "/") CRLF)
     //                       ; base64; see RFC 4648
     //                       ; includes RFC 4880 checksum
-    fn signature_data_parser<'a>(&'a self, i: &'a str) -> IResult<&str, &str> {
+    fn signature_data_parser<'a>(&'a self, i: &'a str) -> IResult<&'a str, &'a str> {
         recognize(many1_count(terminated(take_while1(is_signature_data_char), |x| {
             self.lf_parser(x)
-        })))(i)
+        })))
+        .parse(i)
     }
 }
 
